@@ -7,6 +7,7 @@ RAG FAISS Builder с поддержкой:
 - Обновление базы FAISS без дубликатов
 - urls.txt с уникальными URL
 - Фильтрация URL по seed-доменам, исключение mailto/tel
+- Защита от зацикливания на 404 страницах
 """
 
 import os
@@ -28,6 +29,7 @@ DEFAULT_SEEDS_FILE = "seed_urls.txt"
 
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
+MAX_CONSECUTIVE_WARNS = 5  # Максимум предупреждений подряд перед остановкой
 
 # ----- Вспомогательные функции -----
 def normalize_url(raw_url):
@@ -75,19 +77,26 @@ def is_allowed_url(url, seed_domains):
     if url.startswith("mailto:") or url.startswith("tel:"):
         return False
     for sd in seed_domains:
+        #print(url, sd, url.startswith(sd))
         if url.startswith(sd):
             return True
     return False
 
 
-# ----- BFS Crawl -----
+# ----- BFS Crawl с защитой от зацикливания на 404 -----
 def crawl(seeds, max_pages=None, delay=0.2):
-    seed_domains = get_seed_domains(seeds)
+    seed_domains = seeds
     queue = deque(normalize_url(s) for s in seeds)
     seen = set()
     ordered_urls = []
     pages = {}
     page_counter = 0
+    consecutive_warns = 0  # Счетчик последовательных предупреждений
+    
+    # Словарь для отслеживания глубины URL (сколько раз мы поднимались)
+    url_depths = {}
+    for seed in seeds:
+        url_depths[normalize_url(seed)] = 0
 
     while queue:
         url = queue.popleft()
@@ -97,11 +106,15 @@ def crawl(seeds, max_pages=None, delay=0.2):
         seen.add(url_norm)
         page_counter += 1
 
+        # Получаем текущую глубину URL или устанавливаем по умолчанию
+        current_depth = url_depths.get(url_norm, 0)
+
         if url_norm.lower().endswith(".pdf"):
             text = extract_text_from_pdf_url(url_norm)
             pages[url_norm] = {"text": text, "title": url_norm}
             ordered_urls.append(url_norm)
             print(f"[{page_counter}] [PDF] {url_norm} (text len: {len(text)})")
+            consecutive_warns = 0  # Сбрасываем счетчик при успешной обработке
             if max_pages and len(ordered_urls) >= max_pages:
                 break
             continue
@@ -116,28 +129,105 @@ def crawl(seeds, max_pages=None, delay=0.2):
             pages[url_norm] = {"text": text, "title": title}
             ordered_urls.append(url_norm)
             print(f"[{page_counter}] [HTML] {url_norm} (text len: {len(text)})")
+            consecutive_warns = 0  # Сбрасываем счетчик при успешной обработке
 
-            # BFS ссылки
+            # BFS ссылки с учетом текущей глубины
             for a in soup.find_all("a", href=True):
                 href = a.get("href")
                 try:
                     joined = urljoin(url_norm, href)
                     norm = normalize_url(joined)
                     if norm not in seen and is_allowed_url(norm, seed_domains):
+                        # Сохраняем глубину для нового URL
+                        url_depths[norm] = current_depth
                         queue.append(norm)
                 except Exception:
                     continue
 
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                print(f"[{page_counter}] [WARN] Failed {url_norm}: {e}")
+                pages[url_norm] = {"text": "", "title": ""}
+                ordered_urls.append(url_norm)
+                consecutive_warns += 1
+                
+                # Проверяем, не достигли ли мы лимита предупреждений
+                if consecutive_warns >= MAX_CONSECUTIVE_WARNS:
+                    print(f"[WARN] Достигнуто {MAX_CONSECUTIVE_WARNS} предупреждений подряд. Поднимаемся на уровень выше...")
+                    
+                    # Поднимаемся на уровень выше - ищем родительский URL
+                    parent_url = get_parent_url(url_norm)
+                    if parent_url and parent_url not in seen:
+                        print(f"[INFO] Добавляем родительский URL в очередь: {parent_url}")
+                        queue.appendleft(parent_url)  # Добавляем в начало очереди
+                        url_depths[parent_url] = current_depth + 1
+                    
+                    consecutive_warns = 0  # Сбрасываем счетчик после подъема
+                    
+            else:
+                # Для других HTTP ошибок просто логируем
+                print(f"[{page_counter}] [WARN] Failed {url_norm}: {e}")
+                pages[url_norm] = {"text": "", "title": ""}
+                ordered_urls.append(url_norm)
+                consecutive_warns += 1
+                
         except Exception as e:
             print(f"[{page_counter}] [WARN] Failed {url_norm}: {e}")
             pages[url_norm] = {"text": "", "title": ""}
             ordered_urls.append(url_norm)
+            consecutive_warns += 1
 
+        # Проверяем общий лимит предупреждений для не-404 ошибок
+        if consecutive_warns >= MAX_CONSECUTIVE_WARNS:
+            print(f"[WARN] Достигнуто {MAX_CONSECUTIVE_WARNS} ошибок подряд. Пропускаем следующие URL...")
+            # Пропускаем следующие URL до тех пор, пока не найдем рабочий
+            # Это предотвращает зацикливание на битых ссылках
+            
         if max_pages and len(ordered_urls) >= max_pages:
             print(f"[INFO] Reached max_pages={max_pages}. Stopping crawl.")
             break
         time.sleep(delay)
+    
     return ordered_urls, pages
+
+
+def get_parent_url(url):
+    """
+    Возвращает родительский URL на один уровень выше.
+    Например: 
+    https://example.com/path/to/page -> https://example.com/path/
+    https://example.com/path/ -> https://example.com/
+    """
+    try:
+        parsed = urlparse(url)
+        path_parts = parsed.path.strip('/').split('/')
+        
+        if len(path_parts) > 1:
+            # Убираем последнюю часть пути
+            new_path = '/' + '/'.join(path_parts[:-1]) + '/'
+            return urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                new_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        elif len(path_parts) == 1 and path_parts[0]:
+            # Поднимаемся до корня
+            return urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                '/',
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+        else:
+            # Уже в корне, некуда подниматься
+            return None
+    except Exception:
+        return None
 
 
 def crawl_and_update_faiss(embedder, seeds_file: str, output_dir: str, max_pages: int = 100, delay: float = 0.2, pdf_path: str = None):
